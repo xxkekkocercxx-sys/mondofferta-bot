@@ -1,6 +1,6 @@
 """
-FORWARDER ScontiShark -> @Mondofferta
-Versione FINALE con supporto BOTTONI + DEBUG
+FORWARDER MULTI-CANALE -> @Mondofferta
+Versione UNIFORME - tutti i messaggi uguali + multi-sorgente + bottone Invita personalizzato
 """
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
@@ -12,35 +12,107 @@ import os
 # ========= CONFIG =========
 api_id = 37196582
 api_hash = "7d9e857155940f4a67517f588dce69d"
-source_channel_input = "@ScontiShark"
+
+# LISTA CANALI SORGENTE - tutti i tuoi canali Amazon
+source_channels = [
+    "@ScontiShark",
+    "@CAVALIERIDELRISPARMIO",
+    "@OFFROG",
+    "@SCONTOMATTO1",
+    "@OFFERTEOGNIORA",
+    "@MAXI_OFFERTE",
+    "@OCCHIO_ALLO_SCONTO",
+    "@SUPER_PREZZO",
+]
+
 dest_channel_input = "@Mondofferta"
 il_mio_tag = "sconticoup04c-21"
+mio_link_canale = "https://t.me/Mondofferta"
 # ==========================
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "BOT MONDOFFERTA ATTIVO - @ScontiShark -> @Mondofferta con bottoni"
+    canali = ", ".join(source_channels)
+    return f"BOT MONDOFFERTA ATTIVO - Sorgenti: {canali} -> {dest_channel_input}"
 
 def sostituisci_tag(text):
     if not text:
         return text
     nuovo_tag = f'tag={il_mio_tag}'
-    # Sostituisce sia tag= che tag%3D (url encoded)
     text = re.sub(r'tag=[^&\s]+', nuovo_tag, text)
     text = re.sub(r'tag%3D[^&\s%]+', f'tag%3D{il_mio_tag}', text, flags=re.IGNORECASE)
-    # Se non c'e' nessun tag ma c'e' un link amazon, aggiungilo
-    # Per amazon.it / amazon.com
     if 'amazon.' in text.lower() and 'tag=' not in text.lower() and 'tag%3d' not in text.lower():
-        # Se ha gia' ?, aggiungi &
         if '?' in text:
             text = text + f'&{nuovo_tag}'
         else:
-            # Per link corti amzn.to non aggiungere, tanto si risolve
             if 'amzn.to' not in text:
                 text = text + f'?{nuovo_tag}'
     return text
+
+def estrai_link_amazon(testo, bottoni):
+    pattern = r'https?://[^\s]+(?:amazon\.[^\s]+|amzn\.to/[^\s]+|link\.amazon/[^\s]+)'
+    match = re.search(pattern, testo, re.IGNORECASE)
+    if match:
+        return match.group(0).strip()
+    if bottoni:
+        for row in bottoni:
+            for btn in row:
+                if hasattr(btn, 'url') and btn.url and ('amazon' in btn.url.lower() or 'amzn.to' in btn.url.lower() or 'link.amazon' in btn.url.lower()):
+                    return btn.url
+    return None
+
+def estrai_info_prodotto(testo):
+    righe = [r.strip() for r in testo.split('\n') if r.strip()]
+    titolo = ""
+    prezzo_riga = ""
+    sconto_riga = ""
+    for r in righe:
+        low = r.lower()
+        if 'invita un amico' in low or '#affiliate' in low or 'prendi ora' in low or 'apri su amazon' in low:
+            continue
+        if 'amzlinks.in' in low or 'finisce presto' in low:
+            continue
+        if 'http' in low:
+            continue
+        if '€' in r and (prezzo_riga == ""):
+            if any(x in low for x in ['da ', 'invece di', 'a ', '€']):
+                prezzo_riga = r
+                continue
+        if ('sconto' in low or '%' in r) and sconto_riga == "":
+            if '%' in r:
+                sconto_riga = r
+                continue
+        if len(r) > 10 and '€' not in r and '%' not in r and titolo == "":
+            if not r.startswith('👉') and not r.startswith('💰'):
+                titolo = r
+    if not titolo:
+        for r in righe:
+            if len(r) > 20 and '€' not in r and 'http' not in r.lower() and 'sconto' not in r.lower():
+                titolo = r
+                break
+    return titolo, prezzo_riga, sconto_riga
+
+def crea_messaggio_uniforme(testo_originale, titolo, prezzo, sconto):
+    titolo = titolo.strip()
+    if not titolo:
+        titolo = "OFFERTA AMAZON"
+    parti = []
+    parti.append(f"🔥 {titolo}")
+    parti.append("")
+    if prezzo and '€' in prezzo:
+        parti.append(f"💰 {prezzo}")
+    if sconto and ('sconto' in sconto.lower() or '%' in sconto):
+        if not sconto.strip().startswith('🏷'):
+            parti.append(f"🏷️ {sconto}")
+        else:
+            parti.append(sconto)
+    parti.append("")
+    parti.append("⏰ Finisce presto!")
+    parti.append("")
+    parti.append("👇 Clicca qui sotto per l'offerta")
+    return "\n".join(parti)
 
 session_str = os.environ.get("SESSION_STRING")
 client = None
@@ -48,6 +120,7 @@ client = None
 if session_str:
     session_str = session_str.strip().replace(" ", "").replace("\n", "").replace("\r", "").replace("\t", "")
     print(f"Trovata SESSION_STRING (lunghezza: {len(session_str)})")
+    print(f"Canali sorgente configurati: {source_channels}")
     try:
         client = TelegramClient(StringSession(session_str), api_id, api_hash)
 
@@ -58,68 +131,63 @@ if session_str:
                 chat_username = getattr(chat, 'username', None)
                 chat_title = getattr(chat, 'title', 'N/A')
                 chat_id = event.chat_id
-
-                source_clean = source_channel_input.replace("@","").lower()
                 chat_username_clean = (chat_username or "").lower()
-                
-                # Filtro solo ScontiShark
-                is_source = source_clean in chat_username_clean or source_clean in chat_title.lower() or str(chat_id) == source_channel_input
-                
+                chat_title_clean = (chat_title or "").lower()
+                is_source = False
+                for src in source_channels:
+                    src_clean = src.replace("@","").lower()
+                    if src_clean in chat_username_clean or src_clean in chat_title_clean:
+                        is_source = True
+                        break
+                    if str(chat_id) == src:
+                        is_source = True
+                        break
                 if not is_source:
                     return
-
                 print(f"[MATCH] Messaggio da @{chat_username} ({chat_title}) ID:{chat_id}")
                 messaggio = event.message
                 testo_originale = messaggio.text or messaggio.message or ""
-                testo_nuovo = sostituisci_tag(testo_originale)
-                
-                print(f"[TESTO] {testo_originale[:300]}")
-                print(f"[NUOVO TESTO] {testo_nuovo[:300]}")
-
-                # Gestione bottoni
-                nuovi_bottoni = None
-                if messaggio.buttons:
-                    nuovi_bottoni = []
-                    print(f"[BOTTONI] Trovati {len(messaggio.buttons)} righe di bottoni")
-                    for row in messaggio.buttons:
-                        nuova_riga = []
-                        for btn in row:
-                            try:
-                                # btn.text e btn.url
-                                if hasattr(btn, 'url') and btn.url:
-                                    vecchio_url = btn.url
-                                    nuovo_url = sostituisci_tag(vecchio_url)
-                                    print(f"  [BOTTONE URL] '{btn.text}': {vecchio_url} -> {nuovo_url}")
-                                    nuova_riga.append(Button.url(btn.text, nuovo_url))
-                                elif hasattr(btn, 'text'):
-                                    # Bottone senza url (tipo callback) lo copiamo
-                                    nuova_riga.append(btn)
-                            except Exception as be:
-                                print(f"  [ERRORE BOTTONE] {be}")
-                                nuova_riga.append(btn)
-                        nuovi_bottoni.append(nuova_riga)
+                link_amazon_originale = estrai_link_amazon(testo_originale, messaggio.buttons)
+                if link_amazon_originale:
+                    link_amazon_mio = sostituisci_tag(link_amazon_originale)
+                    print(f"[AMAZON LINK] {link_amazon_originale} -> {link_amazon_mio}")
                 else:
-                    print("[BOTTONI] Nessun bottone inline")
-
-                # Invio
+                    link_amazon_mio = None
+                    print("[AMAZON LINK] Nessun link trovato")
+                    link_amazon_mio = sostituisci_tag(testo_originale)
+                titolo, prezzo, sconto = estrai_info_prodotto(testo_originale)
+                print(f"[INFO] Titolo: {titolo[:80]} | Prezzo: {prezzo} | Sconto: {sconto}")
+                testo_uniforme = crea_messaggio_uniforme(testo_originale, titolo, prezzo, sconto)
+                testo_uniforme = sostituisci_tag(testo_uniforme)
+                print(f"[TESTO UNIFORME]\n{testo_uniforme[:500]}")
+                bottoni_uniformi = []
+                if link_amazon_originale:
+                    bottoni_uniformi.append([Button.url("🛒 Apri su Amazon", link_amazon_mio)])
+                else:
+                    testo_con_tag = sostituisci_tag(testo_originale)
+                    link_fallback = estrai_link_amazon(testo_con_tag, None)
+                    if link_fallback:
+                        bottoni_uniformi.append([Button.url("🛒 Apri su Amazon", link_fallback)])
+                    else:
+                        bottoni_uniformi.append([Button.url("🛒 Apri su Amazon", "https://www.amazon.it/")])
+                bottoni_uniformi.append([Button.url("✉️ Invita un amico", mio_link_canale)])
+                print(f"[BOTTONI UNIFORMI] {bottoni_uniformi}")
                 try:
                     if messaggio.media:
-                        print(f"[INVIO] Con media verso {dest_channel_input}")
-                        await client.send_message(dest_channel_input, testo_nuovo, file=messaggio.media, buttons=nuovi_bottoni, link_preview=False)
+                        print(f"[INVIO] Con media verso {dest_channel_input} - TEMPLATE UNIFORME")
+                        await client.send_message(dest_channel_input, testo_uniforme, file=messaggio.media, buttons=bottoni_uniformi, link_preview=False)
                     else:
-                        print(f"[INVIO] Solo testo verso {dest_channel_input}")
-                        await client.send_message(dest_channel_input, testo_nuovo, buttons=nuovi_bottoni, link_preview=False)
-                    print(f"[OK] Inoltrato su {dest_channel_input} con tag {il_mio_tag}")
+                        print(f"[INVIO] Solo testo verso {dest_channel_input} - TEMPLATE UNIFORME")
+                        await client.send_message(dest_channel_input, testo_uniforme, buttons=bottoni_uniformi, link_preview=False)
+                    print(f"[OK] Inoltrato UNIFORME su {dest_channel_input} con tag {il_mio_tag}")
                 except Exception as e:
                     print(f"[ERRORE INVIO] {e}")
                     import traceback
                     traceback.print_exc()
-
             except Exception as e:
                 print(f"[ERRORE HANDLER] {e}")
                 import traceback
                 traceback.print_exc()
-
     except Exception as e:
         print(f"ERRORE SESSION_STRING: {e}")
         client = None
@@ -130,7 +198,7 @@ def avvia_bot():
     if client is None:
         print("BOT NON AVVIATO - SESSION_STRING mancante!")
         return
-    print(f"Avvio bot {source_channel_input} -> {dest_channel_input}")
+    print(f"Avvio bot {source_channels} -> {dest_channel_input}")
     try:
         client.start()
         print("Client avviato correttamente!")
