@@ -1,12 +1,17 @@
 """
 FORWARDER MULTI-CANALE -> @Mondofferta
-Versione FINALE PULITA Opzione 1 - Foto Amazon + Logo grande alto sx
+VERSIONE V3 - PREZZI REALI DA AMAZON + FIX IMMAGINI
 """
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 import re, threading, os, json, time
 from flask import Flask
-from PIL import Image
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    Image = None
 import requests
 
 api_id = 37196582
@@ -142,7 +147,6 @@ def trova_logo():
     for p in LOGO_CANDIDATI:
         if os.path.exists(p):
             return p
-    # Cerca in /mnt/data solo se esiste (fix per Render)
     try:
         if os.path.exists("/mnt/data"):
             for f in os.listdir("/mnt/data"):
@@ -152,54 +156,186 @@ def trova_logo():
         pass
     return None
 
-def get_amazon_image_url(asin, amazon_link):
-    headers = {'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36','Accept-Language':'it-IT,it;q=0.9'}
+def pulisci_prezzo(txt):
+    if not txt:
+        return ""
+    txt = txt.strip()
+    m = re.search(r'(\d+[.,]\d+)', txt)
+    if not m:
+        return txt
+    num = m.group(1).replace('.', ',')
+    if '€' not in txt:
+        return f"{num} €"
+    txt = re.sub(r'\s*€', ' €', txt)
+    return txt.replace('  ', ' ').strip()
+
+def get_amazon_details(asin, amazon_link):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept-Language': 'it-IT,it;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }
     urls = []
     if asin:
         urls.append(f"https://www.amazon.it/dp/{asin}")
     if amazon_link and 'amazon.' in amazon_link.lower():
         urls.append(amazon_link)
+    if not urls:
+        return None, None, None, None, None
+
     for url in urls:
         try:
-            r = requests.get(url, headers=headers, timeout=12)
+            r = requests.get(url, headers=headers, timeout=15)
             if r.status_code != 200:
                 continue
             html = r.text
-            patterns = [r'"hiRes":"(https://[^"]+m\.media-amazon\.com[^"]+)"',r'"large":"(https://[^"]+m\.media-amazon\.com[^"]+)"',r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"',r'(https://m\.media-amazon\.com/images/I/[^"\s]+\.jpg)']
-            for pat in patterns:
-                m = re.search(pat, html, re.IGNORECASE)
+
+            titolo = None
+            img_url = None
+            prezzo_att = None
+            prezzo_old = None
+            sconto = None
+
+            # TITOLO
+            m = re.search(r'<span[^>]*id="productTitle"[^>]*>\s*(.*?)\s*</span>', html, re.DOTALL | re.IGNORECASE)
+            if m:
+                titolo = re.sub(r'<[^>]+>', '', m.group(1)).strip()
+                titolo = re.sub(r'\s+', ' ', titolo).strip()
+
+            # IMMAGINE - priorita hiRes
+            patterns_img = [
+                r'"hiRes":"(https://[^"]+m\.media-amazon\.com[^"]+)"',
+                r'"large":"(https://[^"]+m\.media-amazon\.com[^"]+)"',
+                r'"mainImageUrl":"(https://[^"]+m\.media-amazon\.com[^"]+)"',
+                r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"',
+            ]
+            for pat in patterns_img:
+                mm = re.search(pat, html, re.IGNORECASE)
+                if mm:
+                    cand = mm.group(1).replace('\\u002F','/').replace('\\/','/')
+                    # Filtra immagini piccole / logo
+                    if 'm.media-amazon.com' in cand and 'SS40' not in cand and 'logo' not in cand.lower():
+                        img_url = cand
+                        break
+            # Fallback: prendi prima immagine grande
+            if not img_url:
+                all_imgs = re.findall(r'(https://m\.media-amazon\.com/images/I/[^"\s]+\.jpg)', html)
+                for cand in all_imgs:
+                    if '._SS' not in cand and len(cand) > 50:
+                        img_url = cand
+                        break
+
+            # PREZZI - cerca tutti gli a-offscreen
+            offscreen = re.findall(r'<span[^>]*class="[^"]*a-offscreen[^"]*"[^>]*>([^<]+)</span>', html)
+            prezzi_trovati = []
+            for p in offscreen:
+                p = p.strip()
+                if '€' in p and re.search(r'\d', p):
+                    # Evita prezzi tipo "€ 0,00" o duplicati
+                    if p not in prezzi_trovati:
+                        prezzi_trovati.append(p.strip())
+
+            # Se troviamo prezzi
+            if prezzi_trovati:
+                # Rimuovi duplicati e pulisci
+                uniq = []
+                for p in prezzi_trovati:
+                    pp = pulisci_prezzo(p)
+                    if pp not in uniq and len(pp) > 3:
+                        uniq.append(pp)
+                prezzi_trovati = uniq
+
+                # Logica: primo prezzo = attuale, secondo (se esiste e piu alto) = vecchio
+                if len(prezzi_trovati) >= 1:
+                    prezzo_att = prezzi_trovati[0]
+                if len(prezzi_trovati) >= 2:
+                    try:
+                        def to_f(s):
+                            mm = re.search(r'(\d+[.,]\d+)', s)
+                            return float(mm.group(1).replace(',', '.')) if mm else 0
+                        # Se secondo e piu alto del primo, e il vecchio
+                        if to_f(prezzi_trovati[1]) > to_f(prezzi_trovati[0]) * 1.05:
+                            prezzo_old = prezzi_trovati[1]
+                    except:
+                        pass
+
+            # Cerca vecchio prezzo specifico barrato
+            if not prezzo_old:
+                m = re.search(r'<span[^>]*class="[^"]*a-price a-text-price[^"]*"[^>]*>.*?<span[^>]*class="[^"]*a-offscreen[^"]*"[^>]*>([^<]+)</span>', html, re.DOTALL | re.IGNORECASE)
                 if m:
-                    img_url = m.group(1).replace('\\u002F','/').replace('\\/','/')
-                    if 'm.media-amazon.com' in img_url:
-                        return img_url
-        except:
+                    prezzo_old = pulisci_prezzo(m.group(1))
+
+            # Cerca sconto
+            m = re.search(r'savingsPercentage[^>]*>([^<]*?(\d+)\s*%[^<]*)', html, re.IGNORECASE)
+            if m:
+                sconto = f"{m.group(2)}%"
+            else:
+                m = re.search(r'Risparmi[^<]*?(\d+)\s*%', html, re.IGNORECASE)
+                if m:
+                    sconto = f"{m.group(1)}%"
+                else:
+                    m = re.search(r'-\s*(\d+)\s*%\s*</span>\s*[^<]*offerta', html, re.IGNORECASE)
+                    if m:
+                        sconto = f"{m.group(1)}%"
+
+            # Calcola sconto se manca
+            if not sconto and prezzo_att and prezzo_old:
+                try:
+                    def to_f(s):
+                        mm = re.search(r'(\d+[.,]\d+)', s)
+                        return float(mm.group(1).replace(',', '.')) if mm else 0
+                    fa = to_f(prezzo_att)
+                    fo = to_f(prezzo_old)
+                    if fa > 0 and fo > fa:
+                        perc = int(round((1 - fa/fo)*100))
+                        if 5 <= perc <= 90:
+                            sconto = f"{perc}%"
+                except:
+                    pass
+
+            if prezzo_att:
+                print(f"[AMAZON OK] {asin} | {prezzo_att} | old:{prezzo_old} | -{sconto} | img:{bool(img_url)}")
+                return titolo, pulisci_prezzo(prezzo_att), pulisci_prezzo(prezzo_old) if prezzo_old else None, sconto, img_url
+
+        except Exception as e:
+            print(f"[AMAZON ERR] {e}")
             continue
-    return None
+
+    return None, None, None, None, None
 
 def scarica_immagine(url, path="/tmp/amazon.jpg"):
     try:
-        headers = {'User-Agent':'Mozilla/5.0'}
+        headers = {'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         r = requests.get(url, headers=headers, timeout=15, stream=True)
         if r.status_code == 200:
             with open(path, 'wb') as f:
                 for chunk in r.iter_content(8192):
                     f.write(chunk)
-            return path
+            # Verifica che sia immagine valida >5KB e non placeholder
+            if os.path.getsize(path) > 5000:
+                return path
     except:
         pass
     return None
 
-def crea_immagine_pulita(asin, amazon_link):
-    img_url = get_amazon_image_url(asin, amazon_link)
+def crea_immagine_pulita(asin, amazon_link, img_url_gia=None):
+    if not PIL_AVAILABLE:
+        return None
+    img_url = img_url_gia
+    if not img_url:
+        _, _, _, _, img_url = get_amazon_details(asin, amazon_link)
     prod_path = None
     if img_url:
         prod_path = scarica_immagine(img_url, "/tmp/prod_amazon.jpg")
-    if not prod_path or not os.path.exists(prod_path) or os.path.getsize(prod_path) < 5000:
+    if not prod_path or not os.path.exists(prod_path):
         return None
     try:
         W, H = 1080, 1080
         canvas = Image.new('RGB', (W, H), (255,255,255))
         prod_img = Image.open(prod_path).convert("RGBA")
+        # Verifica dimensioni minime
+        if prod_img.width < 100 or prod_img.height < 100:
+            return None
         prod_img.thumbnail((900, 900), Image.LANCZOS)
         px = (W - prod_img.width)//2
         py = (H - prod_img.height)//2
@@ -221,13 +357,17 @@ def crea_immagine_pulita(asin, amazon_link):
         except:
             pass
         return out_path
-    except:
+    except Exception as e:
+        print(f"[IMG ERR] {e}")
         return None
 
 def crea_messaggio(titolo, prezzo_att, prezzo_vecchio, sconto, link):
     titolo = titolo.strip() if titolo else "Offerta Amazon"
     if len(titolo) > 5:
         titolo = titolo[0].upper() + titolo[1:]
+    # Taglia titolo lungo
+    if len(titolo) > 100:
+        titolo = titolo[:100].rsplit(' ', 1)[0] + "..."
     parti = []
     parti.append(f"📦 {titolo}")
     parti.append("")
@@ -259,7 +399,7 @@ def home():
     with cache_lock:
         c = len(seen_cache)
     logo = trova_logo()
-    return f"BOT PULITO PRO Opzione1 - Foto Amazon + Logo grande alto sx - {c} cache - Logo: {bool(logo)}"
+    return f"BOT PREZZI REALI V3 - {c} cache - Logo: {bool(logo)} - PIL: {PIL_AVAILABLE}"
 
 @app.route('/clear_cache')
 def clear_cache_route():
@@ -271,7 +411,7 @@ def clear_cache_route():
 
 if session_str:
     session_str = session_str.strip().replace(" ", "").replace("\n", "").replace("\r", "").replace("\t", "")
-    print("SESSION_STRING OK - Pulito Pro Opzione1")
+    print("SESSION_STRING OK - Prezzi Reali V3")
     try:
         client = TelegramClient(StringSession(session_str), api_id, api_hash)
         @client.on(events.NewMessage)
@@ -294,21 +434,34 @@ if session_str:
                 link_orig = estrai_link_amazon(testo_orig, msg.buttons)
                 link_mio = sostituisci_tag(link_orig) if link_orig else "https://www.amazon.it/"
                 asin = estrai_asin(link_orig or link_mio)
-                titolo, prezzo_att, prezzo_vecchio, sconto = estrai_info_prodotto(testo_orig)
-                if is_duplicato(asin, titolo):
+
+                titolo_msg, prezzo_att_msg, prezzo_vecchio_msg, sconto_msg = estrai_info_prodotto(testo_orig)
+
+                if is_duplicato(asin, titolo_msg):
                     print("[SKIP] Duplicato")
                     return
-                print(f"[PREZZI] {prezzo_att} | {prezzo_vecchio} | {sconto} | {asin}")
-                testo_msg = crea_messaggio(titolo, prezzo_att, prezzo_vecchio, sconto, link_mio)
+
+                # PREZZI REALI DA AMAZON
+                titolo_amz, prezzo_att_amz, prezzo_old_amz, sconto_amz, img_url_amz = get_amazon_details(asin, link_mio) if asin else (None, None, None, None, None)
+
+                titolo_finale = titolo_amz if titolo_amz and len(titolo_amz) > 15 else titolo_msg
+                prezzo_att = prezzo_att_amz if prezzo_att_amz else prezzo_att_msg
+                prezzo_vecchio = prezzo_old_amz if prezzo_old_amz else prezzo_vecchio_msg
+                sconto = sconto_amz if sconto_amz else sconto_msg
+
+                print(f"[PREZZI MSG] {prezzo_att_msg} | {prezzo_vecchio_msg} | {sconto_msg}")
+                print(f"[PREZZI AMZ] {prezzo_att} | {prezzo_vecchio} | {sconto} | {asin}")
+
+                testo_msg = crea_messaggio(titolo_finale, prezzo_att, prezzo_vecchio, sconto, link_mio)
                 if not link_mio.startswith("http"):
                     link_mio = "https://www.amazon.it/"
                 bottoni = [[Button.url("🛒 Acquista su Amazon", link_mio)],[Button.url("✉️ Invita un amico", mio_link_canale)]]
                 img_path = None
                 if asin:
-                    img_path = crea_immagine_pulita(asin, link_mio)
+                    img_path = crea_immagine_pulita(asin, link_mio, img_url_amz)
                 if img_path and os.path.exists(img_path):
                     await client.send_message(dest_channel_input, testo_msg, file=img_path, buttons=bottoni, link_preview=False)
-                    print(f"[OK] Pulita Pro - {asin}")
+                    print(f"[OK] V3 Prezzo Reale - {asin} - {prezzo_att}")
                     try:
                         os.remove(img_path)
                     except:
@@ -331,7 +484,7 @@ def avvia_bot():
         return
     try:
         client.start()
-        print("Bot pulito pro avviato!")
+        print("Bot V3 prezzi reali avviato!")
         client.run_until_disconnected()
     except Exception as e:
         print(f"Errore: {e}")
