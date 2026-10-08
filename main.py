@@ -1,11 +1,11 @@
 """
 FORWARDER MULTI-CANALE -> @Mondofferta
-VERSIONE V6 - FIX IMMAGINE MAIN + PREZZI INVERTITI + SCONTO MANCANTE
+VERSIONE V8 - CORREZIONE TESTO AUTOMATICA
 SOLO IMMAGINI AMAZON PULITE (no loghi altri canali)
 """
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-import re, threading, os, json, time, random
+import re, threading, os, json, time, random, html
 from flask import Flask
 try:
     from PIL import Image
@@ -97,7 +97,60 @@ def estrai_link_amazon(testo, bottoni):
                     return btn.url.strip()
     return None
 
+
+def correggi_testo(testo):
+    """
+    V8 - CORREGGE TESTO CON ERRORI: HTML entities, troncamenti, encoding rotto
+    """
+    if not testo:
+        return testo
+    
+    # 1) Decodifica HTML entities (anche doppia codifica)
+    # &#39; -> ', &amp; -> &, &quot; -> ", ecc
+    testo = html.unescape(testo)
+    testo = html.unescape(testo)  # Seconda passata per doppia codifica tipo &amp;#39;
+    
+    # Fix manuali comuni se unescape non basta
+    testo = testo.replace("&#39;", "'").replace("&#x27;", "'").replace("&apos;", "'")
+    testo = testo.replace("&quot;", '"').replace("&#34;", '"').replace("&amp;", "&")
+    testo = testo.replace("&lt;", "<").replace("&gt;", ">")
+    testo = testo.replace("&#x2F;", "/").replace("&#47;", "/")
+    
+    # 2) Rimuove troncamenti tipo "e..." o "e…" alla fine (come da screenshot cassaforte)
+    # Pattern: " e..." o " e…" o " ..."
+    testo = re.sub(r'\s+e\.\.\.\s*$', '', testo, flags=re.IGNORECASE)
+    testo = re.sub(r'\s+e…\s*$', '', testo, flags=re.IGNORECASE)
+    testo = re.sub(r'\s+…\s*$', '', testo)
+    # Se finisce con " e" singolo (troncato), rimuove
+    testo = re.sub(r'\s+e\s*$', '', testo, flags=re.IGNORECASE)
+    
+    # 3) Pulisce caratteri strani e encoding rotto
+    testo = testo.replace('�', '').replace('\x00', '').replace('\r', ' ')
+    
+    # 4) Normalizza spazi e trattini
+    testo = re.sub(r'\s+', ' ', testo)  # Spazi multipli -> singolo
+    testo = re.sub(r'\s*–\s*', ' - ', testo)  # En dash
+    testo = re.sub(r'\s*—\s*', ' - ', testo)  # Em dash
+    testo = testo.strip()
+    
+    # 5) Fix maiuscole/minuscole basilare se tutto maiuscolo
+    # Se titolo è TUTTO MAIUSCOLO, lo rende Title Case
+    if testo.isupper() and len(testo) > 10:
+        testo = testo.title()
+    
+    # 6) Rimuove doppie virgolette strane o spazi prima di punteggiatura
+    testo = re.sub(r'\s+,', ',', testo)
+    testo = re.sub(r'\s+\.', '.', testo)
+    testo = re.sub(r'\s+!', '!', testo)
+    testo = re.sub(r'\s+\?', '?', testo)
+    
+    # 7) Se titolo finisce con "-" o "," troncato, rimuove
+    testo = re.sub(r'[\-,]\s*$', '', testo).strip()
+    
+    return testo
+
 def estrai_info_prodotto(testo):
+
     righe = [r.strip() for r in testo.split('\n') if r.strip()]
     tutti_prezzi = re.findall(r'\d+[.,]\d+\s*€', testo)
     prezzi = []
@@ -142,6 +195,7 @@ def estrai_info_prodotto(testo):
         if len(rc) > 15:
             candidati.append(rc)
     titolo = max(candidati, key=len) if candidati else (righe[0] if righe else "Offerta Amazon")
+    titolo = correggi_testo(titolo)
     return titolo, prezzo_att, prezzo_vecchio, sconto
 
 def trova_logo():
@@ -224,6 +278,7 @@ def get_amazon_details(asin, amazon_link):
                 if m:
                     titolo = re.sub(r'<[^>]+>', '', m.group(1)).strip()
                     titolo = re.sub(r'\s+', ' ', titolo).strip()
+                    titolo = correggi_testo(titolo)
 
                 # ===== IMMAGINE PRINCIPALE V6 =====
                 # 1) landingImage data-old-hires = immagine principale assoluta
@@ -372,7 +427,7 @@ def scarica_immagine(url, path="/tmp/amazon.jpg"):
                 for chunk in r.iter_content(8192):
                     f.write(chunk)
             size = os.path.getsize(path)
-            if size > 8000:  # Almeno 8KB per essere valida
+            if size > 5000:  # Abbassato a 5KB per prodotti piccoli come cassaforte
                 print(f"[IMG DOWNLOAD] OK {size} bytes da {url[:60]}")
                 return path
             else:
@@ -409,8 +464,8 @@ def crea_immagine_pulita(asin, amazon_link, img_url_gia=None):
         canvas = Image.new('RGB', (W, H), (255,255,255))
         prod_img = Image.open(prod_path).convert("RGBA")
         
-        # Verifica che non sia immagine corrotta o placeholder 1x1
-        if prod_img.width < 100 or prod_img.height < 100:
+        # Verifica che non sia immagine corrotta (abbassato per compatibilità)
+        if prod_img.width < 80 or prod_img.height < 80:
             print(f"[IMG] Immagine troppo piccola {prod_img.width}x{prod_img.height}")
             return None
         
@@ -449,7 +504,7 @@ def crea_immagine_pulita(asin, amazon_link, img_url_gia=None):
         return None
 
 def crea_messaggio(titolo, prezzo_att, prezzo_vecchio, sconto, link):
-    titolo = titolo.strip() if titolo else "Offerta Amazon"
+    titolo = correggi_testo(titolo.strip()) if titolo else "Offerta Amazon"
     if len(titolo) > 5:
         titolo = titolo[0].upper() + titolo[1:]
     if len(titolo) > 100:
@@ -485,7 +540,7 @@ def home():
     with cache_lock:
         c = len(seen_cache)
     logo = trova_logo()
-    return f"BOT V6 FIX MAIN IMAGE + PREZZI - {c} cache - Logo: {bool(logo)} - PIL: {PIL_AVAILABLE}"
+    return f"BOT V8 CORREZIONE TESTO - {c} cache - Logo: {bool(logo)} - PIL: {PIL_AVAILABLE}"
 
 @app.route('/clear_cache')
 def clear_cache_route():
@@ -497,7 +552,7 @@ def clear_cache_route():
 
 if session_str:
     session_str = session_str.strip().replace(" ", "").replace("\n", "").replace("\r", "").replace("\t", "")
-    print("SESSION_STRING OK - V6 Fix Main Image + Prezzi")
+    print("SESSION_STRING OK - V8 Correzione Testo")
     try:
         client = TelegramClient(StringSession(session_str), api_id, api_hash)
         @client.on(events.NewMessage)
@@ -574,7 +629,7 @@ def avvia_bot():
         return
     try:
         client.start()
-        print("Bot V6 fix main image + prezzi avviato!")
+        print("Bot V8 correzione testo automatica avviato!")
         client.run_until_disconnected()
     except Exception as e:
         print(f"Errore: {e}")
