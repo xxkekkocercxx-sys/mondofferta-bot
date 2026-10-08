@@ -142,9 +142,14 @@ def trova_logo():
     for p in LOGO_CANDIDATI:
         if os.path.exists(p):
             return p
-    for f in os.listdir("/mnt/data"):
-        if "logo" in f.lower() and f.lower().endswith(('.png','.jpg','.jpeg')):
-            return f"/mnt/data/{f}"
+    # Cerca in /mnt/data solo se esiste (fix per Render)
+    try:
+        if os.path.exists("/mnt/data"):
+            for f in os.listdir("/mnt/data"):
+                if "logo" in f.lower() and f.lower().endswith(('.png','.jpg','.jpeg')):
+                    return f"/mnt/data/{f}"
+    except:
+        pass
     return None
 
 def get_amazon_image_url(asin, amazon_link):
